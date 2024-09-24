@@ -4,9 +4,8 @@ use rand::distributions::Uniform;
 use rand::prelude::*;
 use rand_distr::Normal;
 use rayon::prelude::*;
-
-// Enable the rayon feature for ndarray in Cargo.toml
-// ndarray = { version = "0.15", features = ["rayon"] }
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 /// Enum representing the distance metric to be used.
 #[derive(Clone)]
@@ -22,6 +21,94 @@ pub struct BalancedKMeans {
     pub metric: DistanceMetric,
 }
 
+/// Adjusts the centers of small clusters towards data points from large clusters.
+///
+/// Returns `true` if any centers were adjusted.
+pub fn adjust_centers(
+    centroids: &mut Array2<f32>,
+    labels: &Array1<usize>,
+    cluster_sizes: &Array1<usize>,
+    dataset: &Array2<f32>,
+    threshold: f32,
+    average_size: usize,
+) -> bool {
+    // Identify large cluster data points.
+    let large_clusters: Vec<usize> = cluster_sizes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &size)| {
+            if size > (average_size as f32 * threshold).ceil() as usize {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if large_clusters.is_empty() {
+        // No large clusters to adjust towards.
+        return false;
+    }
+
+    // Collect indices of data points in large clusters.
+    let large_cluster_indices: Vec<usize> = labels
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &label)| {
+            if large_clusters.contains(&label) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if large_cluster_indices.is_empty() {
+        // No data points in large clusters.
+        return false;
+    }
+
+    let num_large = large_cluster_indices.len();
+
+    // Atomic flag to indicate if any center was adjusted.
+    let adjusted = AtomicBool::new(false);
+
+    // Iterate over all clusters in parallel.
+    centroids
+        .axis_iter_mut(Axis(0))
+        .enumerate()
+        .par_bridge()
+        .for_each(|(i, mut centroid)| {
+            let size = cluster_sizes[i];
+            if size > (average_size as f32 * threshold).ceil() as usize {
+                // Not a small cluster; no adjustment needed.
+                return;
+            }
+
+            // Create a thread-local RNG using a seed (for reproducibility or random seeding).
+            let mut rng = StdRng::from_entropy(); // or use a fixed seed if reproducibility is required
+
+            // Select a random data point from large clusters.
+            let selected_idx = large_cluster_indices[rng.gen_range(0..num_large)];
+            let data_point = dataset.row(selected_idx);
+
+            // Compute the weighted average.
+            // Weight of the current center for the weighted average.
+            let wc = size as f32;
+            let wc = if wc > 7.0 { 7.0 } else { wc };
+            let wd = 1.0;
+
+            // Update centroid: (wc * centroid + wd * data_point) / (wc + wd)
+            let new_centroid = (&centroid * wc + &data_point * wd) / (wc + wd);
+            if !new_centroid.iter().all(|&v| v.is_nan()) {
+                centroid.assign(&new_centroid); // Use assign to update the view
+                adjusted.store(true, Ordering::Relaxed);
+            }
+        });
+
+    adjusted.load(Ordering::Relaxed)
+}
+
 impl BalancedKMeans {
     /// Creates a new BalancedKMeans instance with the given number of clusters and iterations.
     pub fn new(n_clusters: usize, n_iters: usize) -> Self {
@@ -31,6 +118,7 @@ impl BalancedKMeans {
             metric: DistanceMetric::Euclidean,
         }
     }
+
     /// Fits the model to the data and returns the cluster centroids.
     pub fn fit(&self, X: &Array2<f32>) -> Array2<f32> {
         let n_samples = X.len_of(Axis(0));
@@ -105,15 +193,30 @@ impl BalancedKMeans {
         .unwrap();
 
         // Step 5: Run a few K-Means iterations on the whole dataset with all centroids.
-        let (final_centroids, _) = self.kmeans_with_initial_centroids(
+        let (mut final_centroids, _) = self.kmeans_with_initial_centroids(
             X,
             self.n_clusters,
             &fine_centroids,
             std::cmp::max(self.n_iters / 10, 2),
         );
 
+        // Step 6: Perform balancing EM iterations to ensure cluster balance.
+        // Initialize cluster sizes based on the final labels.
+        let mut final_labels = self.predict(X, &final_centroids);
+        let mut cluster_sizes = self.count_labels(&final_labels, self.n_clusters);
+        self.balancing_em_iters(
+            X,
+            &mut final_centroids,
+            &mut final_labels,
+            &mut cluster_sizes,
+            self.n_iters,
+            0.25, // balancing_threshold (as per C++ default)
+            2,    // balancing_pullback (as per C++ default)
+        );
+
         final_centroids
     }
+
     /// Predicts the closest cluster each sample in X belongs to.
     pub fn predict(&self, X: &Array2<f32>, centroids: &Array2<f32>) -> Array1<usize> {
         self.assign_labels(X, centroids)
@@ -160,11 +263,7 @@ impl BalancedKMeans {
     }
 
     /// Computes the distance between two points based on the selected metric.
-    fn compute_distance<S1, S2>(
-        &self,
-        x: &ArrayBase<S1, Ix1>,
-        y: &ArrayBase<S2, Ix1>,
-    ) -> f32
+    fn compute_distance<S1, S2>(&self, x: &ArrayBase<S1, Ix1>, y: &ArrayBase<S2, Ix1>) -> f32
     where
         S1: Data<Elem = f32>,
         S2: Data<Elem = f32>,
@@ -254,6 +353,76 @@ impl BalancedKMeans {
         }
 
         fine_clusters_per_meso
+    }
+
+    /// Performs balancing EM iterations to ensure cluster balance.
+    ///
+    /// This function iteratively adjusts cluster centers to balance cluster sizes.
+    fn balancing_em_iters(
+        &self,
+        X: &Array2<f32>,
+        centroids: &mut Array2<f32>,
+        labels: &mut Array1<usize>,
+        cluster_sizes: &mut Vec<usize>,
+        n_iters: usize,
+        balancing_threshold: f32,
+        balancing_pullback: usize,
+    ) {
+        let mut balancing_counter = balancing_pullback;
+        let mut total_iters = 0;
+
+        while total_iters < n_iters {
+            // Balancing step - move the centers around to equalize cluster sizes
+            if total_iters > 0 {
+                let adjusted = adjust_centers(
+                    centroids,
+                    labels,
+                    &Array1::from(cluster_sizes.clone()),
+                    X,
+                    balancing_threshold,
+                    cluster_sizes.iter().sum::<usize>() / self.n_clusters,
+                );
+
+                if adjusted {
+                    if balancing_counter >= balancing_pullback {
+                        balancing_counter -= balancing_pullback;
+                        // If centers were adjusted, increment total_iters to allow more iterations
+                        // This mimics the "pullback" logic in the C++ code
+                        if total_iters < n_iters {
+                            total_iters += 1;
+                        }
+                    } else {
+                        balancing_counter += 1;
+                    }
+                }
+            }
+
+            // E-step: Assign labels based on current centroids
+            *labels = self.assign_labels(X, centroids);
+
+            // M-step: Recompute cluster centers and sizes
+            let new_cluster_sizes = self.count_labels(labels, self.n_clusters);
+            let mut new_centroids = Array2::<f32>::zeros((self.n_clusters, X.len_of(Axis(1))));
+            X.axis_iter(Axis(0))
+                .zip(labels.iter())
+                .for_each(|(x, &label)| {
+                    new_centroids
+                        .row_mut(label)
+                        .zip_mut_with(&x, |a, &b| *a += b);
+                });
+            new_centroids
+                .axis_iter_mut(Axis(0))
+                .enumerate()
+                .for_each(|(i, mut c)| {
+                    if new_cluster_sizes[i] > 0 {
+                        c.mapv_inplace(|v| v / new_cluster_sizes[i] as f32);
+                    }
+                });
+            *centroids = new_centroids;
+            *cluster_sizes = new_cluster_sizes;
+
+            total_iters += 1;
+        }
     }
 }
 
@@ -351,13 +520,8 @@ impl KMeans {
         Array1::from(labels)
     }
 
-
     /// Computes the distance between two points based on the selected metric.
-    fn compute_distance<S1, S2>(
-        &self,
-        x: &ArrayBase<S1, Ix1>,
-        y: &ArrayBase<S2, Ix1>,
-    ) -> f32
+    fn compute_distance<S1, S2>(&self, x: &ArrayBase<S1, Ix1>, y: &ArrayBase<S2, Ix1>) -> f32
     where
         S1: Data<Elem = f32>,
         S2: Data<Elem = f32>,
@@ -367,6 +531,7 @@ impl KMeans {
         }
     }
 }
+
 // fn main() {
 //     // Parameters for data generation
 //     let n_samples = 100000; // Number of data points
@@ -434,18 +599,137 @@ impl KMeans {
 
 fn generate_random_matrix(rows: usize, cols: usize) -> Array2<f32> {
     let mut rng = rand::thread_rng();
-    let dist = Uniform::new(0.0, 1.0);
+    let dist = Uniform::new(-50.0, 50.0);
 
     Array2::from_shape_fn((rows, cols), |_| dist.sample(&mut rng) as f32)
 }
 
+fn verify_assignments(X: &Array2<f32>, centroids: &Array2<f32>, labels: &Array1<usize>) -> bool {
+    let n_samples = X.len_of(Axis(0));
+    let n_centroids = centroids.len_of(Axis(0));
+
+    // Initialize a flag to track verification status
+    let mut all_correct = true;
+
+    // Process in parallel for efficiency
+    let incorrect_assignments = (0..n_samples)
+        .into_par_iter()
+        .filter(|&i| {
+            let x = X.row(i);
+            let assigned_centroid = centroids.row(labels[i]);
+            let assigned_distance = (&x - &assigned_centroid).mapv(|v| v * v).sum();
+
+            // Find the minimum distance to any centroid
+            let mut min_distance = std::f32::INFINITY;
+            for j in 0..n_centroids {
+                let c = centroids.row(j);
+                let dist = (&x - &c).mapv(|v| v * v).sum();
+                if dist < min_distance {
+                    min_distance = dist;
+                }
+            }
+
+            // Check if the assigned distance matches the minimum distance
+            if (assigned_distance - min_distance).abs() > 1e-6 {
+                // Found an incorrect assignment
+                true
+            } else {
+                false
+            }
+        })
+        .count();
+
+    if incorrect_assignments > 0 {
+        println!(
+            "Verification failed: {} points are not assigned to their nearest centroids.",
+            incorrect_assignments
+        );
+        all_correct = false;
+    }
+
+    all_correct
+}
+
+/// Verifies that each centroid is the mean of all points assigned to its cluster.
+///
+/// # Arguments
+///
+/// * `X` - The dataset as a 2D array.
+/// * `centroids` - The centroids as a 2D array.
+/// * `labels` - The cluster labels for each point.
+///
+/// # Returns
+///
+/// * `bool` - `true` if all centroids are correctly computed, `false` otherwise.
+fn verify_centroid_means(X: &Array2<f32>, centroids: &Array2<f32>, labels: &Array1<usize>) -> bool {
+    let n_centroids = centroids.len_of(Axis(0));
+    let n_features = centroids.len_of(Axis(1));
+
+    // Initialize a flag to track verification status
+    let mut all_correct = true;
+
+    // Process each centroid in parallel
+    let incorrect_centroids = (0..n_centroids)
+        .into_par_iter()
+        .filter(|&j| {
+            // Collect indices of points assigned to centroid j
+            let assigned_indices: Vec<usize> = labels
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &label)| if label == j { Some(idx) } else { None })
+                .collect();
+
+            let count = assigned_indices.len();
+            if count == 0 {
+                // No points assigned to this centroid; depending on implementation, this might be acceptable
+                // or might indicate a problem. Here, we'll consider it a failure.
+                println!("Centroid {} has no points assigned.", j);
+                return true; // Incorrect
+            }
+
+            // Sum all points assigned to centroid j
+            let mut sum = Array1::<f32>::zeros(n_features);
+            for &idx in &assigned_indices {
+                sum += &X.row(idx);
+            }
+
+            // Compute mean
+            let mean = &sum / (count as f32);
+
+            // Compare mean with the centroid
+            let centroid = centroids.row(j);
+            let difference = (&mean - &centroid).mapv(|v| v.abs()).sum();
+            let centroid_norm = (&centroid).mapv(|v| v.abs()).sum();
+
+            // Define a small tolerance for floating-point comparisons
+            println!(
+                "Centroid {}: Difference = {} Norm = {} Ratio = {}",
+                j,
+                difference,
+                (&centroid).mapv(|v| v * v).sum(),
+                difference / centroid_norm
+            );
+            difference / centroid_norm > 1e-2
+        })
+        .count();
+
+    if incorrect_centroids > 0 {
+        println!(
+            "Centroid Mean Verification failed: {} centroids are not correctly computed as the mean of their assigned points.",
+            incorrect_centroids
+        );
+        all_correct = false;
+    }
+
+    all_correct
+}
 
 fn main() {
     // Parameters for data generation
     let n_samples = 100000; // Number of data points
-    let n_features = 10;    // Number of dimensions
-    let n_clusters = 256;     // Number of desired clusters
-    let n_iters = 100;      // Number of iterations for K-Means
+    let n_features = 10; // Number of dimensions
+    let n_clusters = 256; // Number of desired clusters
+    let n_iters = 100; // Number of iterations for K-Means
 
     println!("Generating random dataset...");
     println!(
@@ -475,5 +759,23 @@ fn main() {
     for cluster_id in 0..n_clusters {
         let count = labels.iter().filter(|&&x| x == cluster_id).count();
         println!("Cluster {}: {} points", cluster_id, count);
+    }
+
+    // Verification: Ensure all points are assigned to the nearest centroid
+    println!("Starting verification of cluster assignments...");
+    let verification_passed = verify_assignments(&X, &centroids, &labels);
+    if verification_passed {
+        println!("Verification passed: All points are correctly assigned to the nearest centroid.");
+    } else {
+        println!("Verification failed: Some points are not assigned to the nearest centroid.");
+    }
+
+    // Verification: Ensure each centroid is the mean of its assigned points
+    println!("Starting verification of centroid means...");
+    let centroid_verification_passed = verify_centroid_means(&X, &centroids, &labels);
+    if centroid_verification_passed {
+        println!("Centroid Mean Verification passed: All centroids are correctly computed as the mean of their assigned points.");
+    } else {
+        println!("Centroid Mean Verification failed: Some centroids are not correctly computed.");
     }
 }
